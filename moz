@@ -1,0 +1,240 @@
+#!/bin/bash
+
+# Options: Where things are located
+GCLI_HOME=/Users/joe/projects/mozilla/gcli
+OBJ=obj-debug
+
+# Options: The default profile to run with
+PROFILE=Development
+
+if [ -f ./.mozconfig ]; then
+  FIREFOX_HOME=`pwd`
+else
+  echo "Must be run from a checkout of mozilla-central"
+  exit 0
+fi
+
+# Options: The directories that we build in an incremental build
+dirs=( \
+  $FIREFOX_HOME/$OBJ/browser/themes \
+  $FIREFOX_HOME/$OBJ/browser/devtools \
+  $FIREFOX_HOME/$OBJ/browser/base \
+  $FIREFOX_HOME/$OBJ/browser/locales \
+  $FIREFOX_HOME/$OBJ/toolkit/devtools \
+  $FIREFOX_HOME/$OBJ/toolkit/themes \
+  $FIREFOX_HOME/$OBJ/browser/app \
+)
+
+# Options
+PLATFORM=unknown
+UNAME=`uname -s`
+if [ "$UNAME" = "Darwin" ]; then
+  PLATFORM=mac
+fi
+if [ `echo $UNAME | grep MINGW` ]; then
+  PLATFORM=win
+fi
+if [ "$UNAME" = "Linux" ]; then
+  PLATFORM=linux
+fi
+
+# Options: Defaults settings altered from the command line arguments by parse()
+BUILD=incremental
+OPT_GCLI=false
+OPT_MQSYNC=false
+REMOTE=none
+ACTION=run
+TEST_PATH=browser/devtools
+
+
+# Parse the command line options to fill out the options above
+function parse {
+  for i
+  do
+    case $i in
+      (--help|-h)
+        echo "Usage: moz [--gcli|-g] [--mqsync|-q] [--rsync|-r] [--clobber|--full|--nobuild|-c|-f|-n] [--profile=XXXX|-p=XXXX] [--test|-t|--test=XXXX|-t=XXXX]"
+        exit 0
+        ;;
+      (--gcli|-g)
+        OPT_GCLI=true
+        ;;
+      (--remote=*|-r=*)
+        REMOTE=`echo "$i" | sed "s/^--remote\=//" | sed "s/^-r=//"`
+        ACTION=noaction
+        BUILD=nobuild
+        ;;
+      (--clobber|-c)
+        BUILD=clobber
+        ;;
+      (--klobbertests|-k)
+        BUILD=klobbertests
+        ;;
+      (--full|-f)
+        BUILD=full
+        ;;
+      (--incremental|-i)
+        # this is the default build type
+        BUILD=full
+        ;;
+      (--nobuild|-nb)
+        BUILD=nobuild
+        ;;
+      (--run|-u)
+        # this is the default action
+        ACTION=run
+        ;;
+      (--profile=*|-p=*)
+        PROFILE=`echo "$i" | sed "s/^--profile\=//" | sed "s/^-p=//"`
+        ;;
+      (--test|-t)
+        ACTION=test
+        ;;
+      (--test=*|-t=*)
+        ACTION=test
+        TEST_PATH=`echo "$i" | sed "s/^--test\=//" | sed "s/^-t=//"`
+        if [ "$TEST_PATH" = "all" ]; then
+          TEST_PATH=browser/devtools
+        fi
+        WITHOUT_PREFIX=`echo $TEST_PATH | grep "^browser\/devtools\/.*"`
+        if [ "$WITHOUT_PREFIX" = "" ]; then
+          TEST_PATH="browser/devtools/$TEST_PATH"
+        fi
+        WITHOUT_TEST=`echo $TEST_PATH | grep ".*\/test.*"`
+        if [ "$WITHOUT_TEST" = "" ]; then
+          TEST_PATH="$TEST_PATH/test"
+        fi
+        ;;
+      (--noaction|-na)
+        ACTION=noaction
+        ;;
+      (*)
+        echo No such option $i
+        exit 1
+    esac
+  done
+}
+
+# Do the optional setup parts
+function setup {
+  # Do an rsync before building
+  if [ "$REMOTE" != "none" ]; then
+    remote
+  fi
+
+  # Build GCLI into the FIREFOX dir
+  if [ "$OPT_GCLI" = "true" ]; then
+    echo "#### gcli ###########################################################"
+    cd $GCLI_HOME
+    node gcli.js firefox $FIREFOX_HOME > /dev/null
+    if [ $? -ne 0 ]; then
+      exit $?
+    fi
+    cd $FIREFOX_HOME
+  fi
+}
+
+# Do the build somewhere else
+function remote {
+  echo "#### rsync ##########################################################"
+#    --filter='merge /home/local/sbin/cron-rsync-achor-exclude' \
+
+  rsync --stats --out-format='%-8b %i %n%L' \
+    --recursive --links --specials --times --compress --delete --human-readable \
+    --rsh='ssh' \
+    --exclude='/obj-*' \
+    --exclude='/.mozconfig' \
+    $FIREFOX_HOME \
+    $REMOTE:/home/joe/projects/mozilla
+}
+
+# Run the build step
+function build {
+  echo "#### build: $BUILD ####################################################"
+  case $BUILD in
+    (clobber)
+      rm -rf $OBJ
+      time ./mach build
+      ;;
+    (full)
+      time ./mach build
+      ;;
+    (klobbertests)
+      rm -rf $OBJ/_tests/testing/mochitest/browser/browser/devtools
+      time build_incremental
+      ;;
+    (incremental)
+      time build_incremental
+      ;;
+    (nobuild)
+      # none
+      ;;
+  esac
+
+  return $?
+}
+
+# Build all the directories specified at the top of the file
+function build_incremental {
+  for dir in ${dirs[@]}
+  do
+    if ! make -s -C $dir
+    then
+      read -p "$dir failed"
+      return 1;
+    fi
+  done
+
+  return 0;
+}
+
+# The post build step is run/test/none
+function action {
+  echo "#### action: $ACTION ##################################################"
+  case $ACTION in
+    (run)
+      case $PLATFORM in
+        (mac)
+          if [ "$OBJ" = "obj-debug" ]; then
+            MACAPP=$OBJ/dist/NightlyDebug.app
+          else
+            MACAPP=$OBJ/dist/Nightly.app
+          fi
+          echo "#### $MACAPP/Contents/MacOS/firefox-bin -P $PROFILE"
+          $MACAPP/Contents/MacOS/firefox-bin -P $PROFILE
+          ;;
+        (win|linux)
+          echo "#### $OBJ/dist/bin/firefox -P $PROFILE"
+          $OBJ/dist/bin/firefox -P $PROFILE
+          ;;
+      esac
+      ;;
+    (test)
+      mkdir -p $OBJ/test-results
+      OUTPUT=$OBJ/test-results/output_`date +%Y-%m-%d_%H-%M`.txt
+      # export COVERAGE=1
+      export TEST_PATH
+      /Applications/MacVim.app/Contents/MacOS/Vim --remote-tab $OUTPUT
+      echo TEST_PATH=$TEST_PATH
+      echo "vi $OUTPUT"
+      make -C $OBJ mochitest-browser-chrome | tee $OUTPUT | grep "^\(TEST-UNEXPECTED-[A-Z]* |\)\|\(console.[a-z]*:\)"
+      # python -OO build/pymake/make.py -C $OBJ mochitest-browser-chrome
+      ;;
+    (noaction)
+      # none
+      ;;
+  esac
+}
+
+cd $FIREFOX_HOME
+parse $*
+setup
+build
+action
+
+if [ "$PLATFORM" = "win" ]; then
+  read -p "Done"
+else
+  echo "Done"
+fi
+
